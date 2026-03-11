@@ -1,0 +1,8 @@
+node_modules/
+downloads/
+data/
+cookies/
+.env
+*.log
+node_modules/
+.env

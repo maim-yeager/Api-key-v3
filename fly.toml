@@ -1,0 +1,49 @@
+app = "video-dl-api"
+primary_region = "sin"  # Singapore — closest to Bangladesh
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "3000"
+  NODE_ENV = "production"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
+
+# Persistent volume for downloads, DB, and cookies
+[[mounts]]
+  source = "video_dl_data"
+  destination = "/app/data"
+
+[[mounts]]
+  source = "video_dl_downloads"
+  destination = "/app/downloads"
+
+[[mounts]]
+  source = "video_dl_cookies"
+  destination = "/app/cookies"
+
+[checks]
+  [checks.health]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/"
+    port = 3000
+    timeout = "5s"
+    type = "http"
