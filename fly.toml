@@ -4,7 +4,7 @@
 #
 
 app = 'app-red-darkness-7265'
-primary_region = 'iad'
+primary_region = 'sin'
 
 [build]
 
