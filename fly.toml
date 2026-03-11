@@ -1,49 +1,23 @@
-app = "video-dl-api"
-primary_region = "sin"  # Singapore — closest to Bangladesh
+# fly.toml app configuration file generated for app-red-darkness-7265 on 2026-03-11T10:53:05Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'app-red-darkness-7265'
+primary_region = 'iad'
 
 [build]
-  dockerfile = "Dockerfile"
-
-[env]
-  PORT = "3000"
-  NODE_ENV = "production"
 
 [http_service]
-  internal_port = 3000
+  internal_port = 8080
   force_https = true
-  auto_stop_machines = true
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
-
-  [http_service.concurrency]
-    type = "connections"
-    hard_limit = 25
-    soft_limit = 20
+  processes = ['app']
 
 [[vm]]
-  memory = "1gb"
-  cpu_kind = "shared"
+  memory = '1gb'
+  cpu_kind = 'shared'
   cpus = 1
-
-# Persistent volume for downloads, DB, and cookies
-[[mounts]]
-  source = "video_dl_data"
-  destination = "/app/data"
-
-[[mounts]]
-  source = "video_dl_downloads"
-  destination = "/app/downloads"
-
-[[mounts]]
-  source = "video_dl_cookies"
-  destination = "/app/cookies"
-
-[checks]
-  [checks.health]
-    grace_period = "10s"
-    interval = "30s"
-    method = "GET"
-    path = "/"
-    port = 3000
-    timeout = "5s"
-    type = "http"
+  memory_mb = 256
