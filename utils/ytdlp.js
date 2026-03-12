@@ -1,15 +1,55 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { getDB } = require('./database');
 
 const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || path.join(__dirname, '..', 'downloads');
 const COOKIES_DIR  = path.join(__dirname, '..', 'cookies');
+const TEMP_DIR     = path.join(__dirname, '..', 'temp');
 
 // Ensure dirs exist
-[DOWNLOAD_DIR, COOKIES_DIR].forEach(d => {
+[DOWNLOAD_DIR, COOKIES_DIR, TEMP_DIR].forEach(d => {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
+
+// Clean temp files older than 1 hour
+setInterval(() => {
+  const now = Date.now();
+  fs.readdir(TEMP_DIR, (err, files) => {
+    if (err) return;
+    files.forEach(file => {
+      const filePath = path.join(TEMP_DIR, file);
+      fs.stat(filePath, (err, stats) => {
+        if (err) return;
+        if (now - stats.mtimeMs > 3600000) {
+          fs.unlink(filePath, () => {});
+        }
+      });
+    });
+  });
+}, 3600000);
+
+// ─── Helper: Format bytes ───────────────────────────────────────────────────
+function formatBytes(bytes) {
+  if (!bytes || bytes === 0) return '—';
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return (bytes / Math.pow(1024, i)).toFixed(1) + ' ' + sizes[Math.min(i, 3)];
+}
+
+// ─── Helper: Format duration ────────────────────────────────────────────────
+function formatDuration(seconds) {
+  if (!seconds) return '0:00';
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
+  return `${minutes}:${secs.toString().padStart(2, '0')}`;
+}
 
 // ─── Detect yt-dlp binary ────────────────────────────────────────────────────
 function getYtDlpBin() {
@@ -82,16 +122,113 @@ function runYtDlp(args) {
   });
 }
 
-// ─── VIDEO INFO ───────────────────────────────────────────────────────────────
-async function getVideoInfo(url, useCookies = true) {
-  const platform = detectPlatform(url);
-  const cookieFile = useCookies ? getCookieFile(platform) : null;
-
+// ─── Get ALL formats with filesize (PROBLEM 2 FIXED) ─────────────────────────
+async function getAllFormats(url, cookieFile) {
   const args = [
     '--dump-json',
     '--no-playlist',
     '--no-warnings',
-    '--no-write-thumbnail',  // don't write file, we get URL from metadata
+    '--list-formats'  // This gives ALL formats
+  ];
+
+  if (cookieFile) {
+    args.push('--cookies', cookieFile);
+  }
+
+  args.push(url);
+
+  const raw = await runYtDlp(args);
+  const data = JSON.parse(raw);
+  
+  return data.formats || [];
+}
+
+// ─── PROCESS EACH FORMAT (PROBLEM 1, 5, 6 FIXED) ────────────────────────────
+function processFormats(formats, videoUrl, duration) {
+  const processed = [];
+  const audioFormats = formats.filter(f => 
+    f.acodec && f.acodec !== 'none' && 
+    (!f.vcodec || f.vcodec === 'none')
+  );
+
+  formats.forEach(f => {
+    // Calculate filesize if missing
+    let filesize = f.filesize || f.filesize_approx;
+    if (!filesize && f.tbr && duration) {
+      filesize = Math.round((f.tbr * 1000 / 8) * duration);
+    }
+
+    // Determine format type
+    const hasVideo = f.vcodec && f.vcodec !== 'none';
+    const hasAudio = f.acodec && f.acodec !== 'none';
+    const isVideoOnly = hasVideo && !hasAudio;
+    const isAudioOnly = !hasVideo && hasAudio;
+    const isDASHAudio = isAudioOnly && f.format_note?.includes('DASH');
+
+    // Quality label
+    let quality = '—';
+    if (f.height) {
+      quality = f.height + 'p';
+    } else if (f.format_note) {
+      quality = f.format_note;
+    } else if (isAudioOnly) {
+      quality = f.abr ? f.abr + 'kbps' : 'Audio';
+    }
+
+    // Create download URL
+    let downloadUrl = f.url;
+
+    // For video-only formats: create merged URL (PROBLEM 1 FIXED)
+    if (isVideoOnly) {
+      // Find best matching audio format
+      const bestAudio = audioFormats.sort((a, b) => (b.abr || 0) - (a.abr || 0))[0];
+      
+      if (bestAudio) {
+        // Generate merge token
+        const token = crypto.randomBytes(16).toString('hex');
+        downloadUrl = `/api/download/merge?video_id=${f.format_id}&audio_id=${bestAudio.format_id}&url=${encodeURIComponent(videoUrl)}&token=${token}`;
+      }
+    }
+
+    // Add to processed list (PROBLEM 2 FIXED - ALL formats included)
+    processed.push({
+      format_id: f.format_id,
+      ext: f.ext,
+      quality: quality,
+      filesize: filesize,
+      filesize_str: formatBytes(filesize),
+      has_video: hasVideo,
+      has_audio: hasAudio,
+      is_video_only: isVideoOnly,
+      is_audio_only: isAudioOnly,
+      width: f.width,
+      height: f.height,
+      fps: f.fps,
+      vcodec: f.vcodec,
+      acodec: f.acodec,
+      tbr: f.tbr,
+      vbr: f.vbr,
+      abr: f.abr,
+      format_note: f.format_note,
+      url: downloadUrl,
+      // Hide DASH audio from UI (PROBLEM 6 FIXED)
+      hide_from_ui: isDASHAudio ? true : false
+    });
+  });
+
+  return processed;
+}
+
+// ─── VIDEO INFO (PROBLEM 2, 5, 6 FIXED) ─────────────────────────────────────
+async function getVideoInfo(url, useCookies = true) {
+  const platform = detectPlatform(url);
+  const cookieFile = useCookies ? getCookieFile(platform) : null;
+
+  // Get basic info first
+  const args = [
+    '--dump-json',
+    '--no-playlist',
+    '--no-warnings',
   ];
 
   if (cookieFile) {
@@ -103,31 +240,23 @@ async function getVideoInfo(url, useCookies = true) {
   const raw = await runYtDlp(args);
   const info = JSON.parse(raw);
 
-  return extractVideoInfo(info);
+  // Get ALL formats separately (to ensure we have everything)
+  const allFormats = await getAllFormats(url, cookieFile);
+
+  // Process formats with our enhanced logic
+  const processedFormats = processFormats(allFormats, url, info.duration);
+
+  // Find best play URL for preview (PROBLEM 5 FIXED)
+  const bestPlayFormat = processedFormats.find(f => 
+    f.height >= 720 && f.has_video && f.has_audio && f.ext === 'mp4'
+  ) || processedFormats.find(f => f.has_video && f.has_audio) || processedFormats[0];
+
+  // Extract only the fields we need for response
+  return extractVideoInfo(info, processedFormats, bestPlayFormat?.url);
 }
 
 // ─── Extract only the fields we need ─────────────────────────────────────────
-function extractVideoInfo(info) {
-  const formats = (info.formats || []).map(f => ({
-    format_id:   f.format_id,
-    format_note: f.format_note,
-    ext:         f.ext,
-    resolution:  f.resolution || (f.width && f.height ? `${f.width}x${f.height}` : null),
-    width:       f.width,
-    height:      f.height,
-    fps:         f.fps,
-    vcodec:      f.vcodec,
-    acodec:      f.acodec,
-    filesize:    f.filesize || f.filesize_approx,
-    tbr:         f.tbr,
-    abr:         f.abr,
-    vbr:         f.vbr,
-    has_video:   f.vcodec && f.vcodec !== 'none',
-    has_audio:   f.acodec && f.acodec !== 'none',
-    url:         f.url, // direct stream URL for preview
-    protocol:    f.protocol,
-  }));
-
+function extractVideoInfo(info, processedFormats, playUrl) {
   // Group subtitles
   const subtitles = {};
   if (info.subtitles) {
@@ -150,7 +279,7 @@ function extractVideoInfo(info) {
     // ── Media Info ──
     ext:                 info.ext,
     duration:            info.duration,
-    duration_string:     info.duration_string,
+    duration_string:     formatDuration(info.duration),
     thumbnail:           info.thumbnail,
     thumbnails:          (info.thumbnails || []).slice(-5), // last 5 (best quality)
 
@@ -198,13 +327,16 @@ function extractVideoInfo(info) {
     categories:          info.categories,
     tags:                info.tags,
 
-    // ── Formats & Subtitles ──
-    formats,
+    // ── Formats & Subtitles (PROBLEM 2 FIXED) ──
+    formats:             processedFormats,
     subtitles,
     automatic_captions:  info.automatic_captions ? Object.keys(info.automatic_captions) : [],
 
+    // ── Play URL for preview (PROBLEM 5 FIXED) ──
+    play_url:            playUrl,
+
     // ── Suggested download options ──
-    suggested_formats: suggestFormats(formats),
+    suggested_formats: suggestFormats(processedFormats),
   };
 }
 
@@ -222,12 +354,12 @@ function suggestFormats(formats) {
     '1080p': best1080?.format_id,
     '720p':  best720?.format_id,
     '480p':  best480?.format_id,
-    'best':  videoFormats[videoFormats.length - 1]?.format_id,
+    'best':  videoFormats[0]?.format_id,
     'audio': bestAudio?.format_id,
   };
 }
 
-// ─── DOWNLOAD VIDEO ───────────────────────────────────────────────────────────
+// ─── DOWNLOAD VIDEO (PROBLEM 1, 3, 4 FIXED) ───────────────────────────────────
 async function downloadVideo(url, options = {}) {
   const {
     format    = 'bestvideo+bestaudio/best',
@@ -235,12 +367,16 @@ async function downloadVideo(url, options = {}) {
     audioOnly = false,
     subtitles = true,
     historyId,
+    directStream = false, // If true, return file path for streaming
   } = options;
 
   const platform   = detectPlatform(url);
   const cookieFile = getCookieFile(platform);
 
-  const outputTemplate = path.join(DOWNLOAD_DIR, `${historyId || '%(id)s'}.%(ext)s`);
+  // For direct streaming, use temp directory
+  const targetDir = directStream ? TEMP_DIR : DOWNLOAD_DIR;
+  const fileId = historyId || `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const outputTemplate = path.join(targetDir, `${fileId}.%(ext)s`);
 
   const args = [
     '--no-playlist',
@@ -250,14 +386,13 @@ async function downloadVideo(url, options = {}) {
     '-o', outputTemplate,
   ];
 
-  // ── Format Selection ──
+  // ── Format Selection (PROBLEM 1 FIXED - merging enabled) ──
   if (audioOnly) {
     args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
   } else {
     args.push('-f', format);
     if (outputExt === 'mp4') {
-      args.push('--merge-output-format', 'mp4',
-                '--postprocessor-args', 'ffmpeg:-c:v copy -c:a aac');
+      args.push('--merge-output-format', 'mp4');
     } else if (outputExt === 'mkv') {
       args.push('--merge-output-format', 'mkv');
     }
@@ -285,15 +420,44 @@ async function downloadVideo(url, options = {}) {
 
   // Find downloaded file
   const downloadedFile = path.join(
-    DOWNLOAD_DIR,
-    `${historyId || info.id}.${audioOnly ? 'mp3' : outputExt}`
+    targetDir,
+    `${fileId}.${audioOnly ? 'mp3' : outputExt}`
   );
 
   return {
     file: fs.existsSync(downloadedFile) ? downloadedFile : null,
-    info: extractVideoInfo(info),
-    subtitleFiles: getSubtitleFiles(historyId || info.id),
+    fileId: fileId,
+    info: extractVideoInfo(info, [], null),
+    subtitleFiles: getSubtitleFiles(fileId),
   };
+}
+
+// ─── AUDIO ONLY EXTRACTION (PROBLEM 3 FIXED) ─────────────────────────────────
+async function extractAudio(url, options = {}) {
+  const {
+    quality = '192',
+    historyId,
+    directStream = true
+  } = options;
+
+  return downloadVideo(url, {
+    audioOnly: true,
+    outputExt: 'mp3',
+    format: 'bestaudio/best',
+    historyId,
+    directStream
+  });
+}
+
+// ─── MERGE VIDEO + AUDIO (PROBLEM 1 FIXED) ───────────────────────────────────
+async function mergeFormats(url, videoId, audioId, options = {}) {
+  const format = `${videoId}+${audioId}`;
+  return downloadVideo(url, {
+    format: format,
+    outputExt: 'mp4',
+    directStream: true,
+    ...options
+  });
 }
 
 function getSubtitleFiles(id) {
@@ -306,7 +470,12 @@ function getSubtitleFiles(id) {
 module.exports = {
   getVideoInfo,
   downloadVideo,
+  extractAudio,
+  mergeFormats,
   detectPlatform,
   DOWNLOAD_DIR,
   COOKIES_DIR,
+  TEMP_DIR,
+  formatBytes,
+  formatDuration
 };
