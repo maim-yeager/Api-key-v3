@@ -1,10 +1,10 @@
-# fly.toml app configuration file generated for app-red-darkness-7265 on 2026-03-11T10:53:05Z
+# fly.toml app configuration file generated for api-key-v3-drak on 2026-03-12T12:12:22Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'app-red-darkness-7265'
-primary_region = 'sin'
+app = 'api-key-v3-drak'
+primary_region = 'bom'
 
 [build]
 
@@ -13,11 +13,11 @@ primary_region = 'sin'
   force_https = true
   auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 1
+  min_machines_running = 0
   processes = ['app']
 
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
-  cpus = 2
-  memory_mb = 256
+  cpus = 1
+  memory_mb = 512
