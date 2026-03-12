@@ -1,213 +1,309 @@
 const express = require('express');
-const router = express.Router();
-const path = require('path');
+const { exec } = require('child_process');
 const fs = require('fs');
-const { v4: uuidv4 } = require('uuid');
-const { downloadVideo, getVideoInfo, detectPlatform, DOWNLOAD_DIR } = require('../utils/ytdlp');
-const { getDB } = require('../utils/database');
+const path = require('path');
+const util = require('util');
+const crypto = require('crypto');
 
-// ─── Valid output extensions ──────────────────────────────────────────────────
-const VALID_VIDEO_EXTS = ['mp4', 'mkv', 'webm', 'avi', 'mov'];
-const VALID_AUDIO_EXTS = ['mp3', 'm4a', 'opus', 'wav', 'flac', 'aac'];
+const execPromise = util.promisify(exec);
+const router = express.Router();
 
-/**
- * POST /api/download
- *
- * Body:
- * {
- *   url:        string  (required)
- *   type:       'video' | 'audio'          (default: 'video')
- *   format:     'mp4' | 'mkv' | 'mp3' ... (default: 'mp4')
- *   quality:    'best' | '1080p' | '720p' | '480p' | '360p' | format_id
- *   subtitles:  boolean (default: true)
- *   use_cookies: boolean (default: true)
- * }
- *
- * Returns:
- * - If file is small enough: streams the file directly
- * - Otherwise: returns download URL
- */
+// Temp directory for downloads
+const TEMP_DIR = path.join(__dirname, '..', 'temp');
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+// Clean temp files older than 1 hour
+setInterval(() => {
+  const now = Date.now();
+  fs.readdir(TEMP_DIR, (err, files) => {
+    if (err) return;
+    files.forEach(file => {
+      const filePath = path.join(TEMP_DIR, file);
+      fs.stat(filePath, (err, stats) => {
+        if (err) return;
+        if (now - stats.mtimeMs > 3600000) {
+          fs.unlink(filePath, () => {});
+        }
+      });
+    });
+  });
+}, 3600000);
+
+// Helper: Check if yt-dlp and ffmpeg exist
+async function checkDependencies() {
+  try {
+    await execPromise('yt-dlp --version');
+    await execPromise('ffmpeg -version');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── POST /api/download - Download specific format (PROBLEM 4 FIXED) ──────────
 router.post('/', async (req, res) => {
-  const {
-    url,
-    type       = 'video',
-    format     = type === 'audio' ? 'mp3' : 'mp4',
-    quality    = 'best',
-    subtitles  = true,
-    use_cookies = true,
-  } = req.body;
+  const { url, format_id, type = 'video' } = req.body;
 
-  if (!url) return res.status(400).json({ error: 'url is required' });
-  if (!isValidUrl(url)) return res.status(400).json({ error: 'Invalid URL' });
-
-  const audioOnly = type === 'audio' || VALID_AUDIO_EXTS.includes(format);
-  const outputExt = audioOnly ? (VALID_AUDIO_EXTS.includes(format) ? format : 'mp3')
-                              : (VALID_VIDEO_EXTS.includes(format) ? format : 'mp4');
-
-  // Build yt-dlp format selector
-  let formatSelector;
-  if (audioOnly) {
-    formatSelector = 'bestaudio/best';
-  } else {
-    const heightMap = { '1080p': 1080, '720p': 720, '480p': 480, '360p': 360 };
-    const h = heightMap[quality];
-    if (h) {
-      formatSelector = `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`;
-    } else if (quality !== 'best' && /^\d+$/.test(quality)) {
-      // Raw format_id passed
-      formatSelector = quality;
-    } else {
-      formatSelector = 'bestvideo+bestaudio/best';
-    }
+  if (!url) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'URL is required' 
+    });
   }
 
-  const historyId = uuidv4();
-  const db = getDB();
-  const platform = detectPlatform(url);
+  const depsOk = await checkDependencies();
+  if (!depsOk) {
+    return res.status(500).json({ 
+      success: false, 
+      error: 'yt-dlp or ffmpeg not installed on server' 
+    });
+  }
 
-  // Insert pending record
-  db.prepare(`
-    INSERT INTO download_history (id, url, platform, format_type, quality, status)
-    VALUES (?, ?, ?, ?, ?, 'pending')
-  `).run(historyId, url, platform, outputExt, quality);
+  const ext = type === 'audio' ? 'mp3' : 'mp4';
+  const outputFile = path.join(TEMP_DIR, `download_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`);
 
   try {
-    const result = await downloadVideo(url, {
-      format: formatSelector,
-      outputExt,
-      audioOnly,
-      subtitles: subtitles && !audioOnly,
-      historyId,
-      useCookies: use_cookies,
+    console.log(`[download] Processing: ${url} (format: ${format_id || 'best'})`);
+
+    let command;
+    
+    if (type === 'audio') {
+      // Audio extraction (PROBLEM 3 FIXED)
+      command = `yt-dlp -x --audio-format mp3 --audio-quality 192k -o "${outputFile}" "${url}"`;
+    } else if (format_id) {
+      // Specific video format with best audio merged (PROBLEM 1 FIXED)
+      command = `yt-dlp -f "${format_id}+bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio" --merge-output-format mp4 -o "${outputFile}" "${url}"`;
+    } else {
+      // Best quality
+      command = `yt-dlp -f "bestvideo+bestaudio" --merge-output-format mp4 -o "${outputFile}" "${url}"`;
+    }
+
+    // Execute download with timeout (10 minutes)
+    await execPromise(command, { 
+      maxBuffer: 500 * 1024 * 1024, 
+      timeout: 600000 
     });
 
-    // Update history record
-    db.prepare(`
-      UPDATE download_history SET
-        title = ?, status = 'completed', file_size = ?,
-        duration = ?, thumbnail = ?, completed_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(
-      result.info.title,
-      getFileSize(result.file),
-      result.info.duration,
-      result.info.thumbnail,
-      historyId,
-    );
+    if (!fs.existsSync(outputFile)) {
+      throw new Error('Download failed - no output file generated');
+    }
 
-    // Build subtitle download links
-    const subtitleLinks = result.subtitleFiles.map(sf => ({
-      filename: sf.filename,
-      download_url: `/api/download/file/${historyId}/${sf.filename}`,
-    }));
+    const stat = fs.statSync(outputFile);
 
-    // If file exists, provide direct stream option + download URL
-    if (result.file && fs.existsSync(result.file)) {
-      const filename = path.basename(result.file);
-      return res.json({
-        success: true,
-        history_id: historyId,
-        title: result.info.title,
-        thumbnail: result.info.thumbnail,
-        duration: result.info.duration,
-        filesize: getFileSize(result.file),
-        format: outputExt,
-        quality,
-        download_url: `/api/download/file/${historyId}/${filename}`,
-        subtitle_files: subtitleLinks,
-        info: result.info,
+    // Set headers for direct download (NO REDIRECT)
+    res.setHeader('Content-Type', type === 'audio' ? 'audio/mpeg' : 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="download.${ext}"`);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length');
+
+    // Stream file directly
+    const stream = fs.createReadStream(outputFile);
+    stream.pipe(res);
+
+    // Clean up after streaming
+    stream.on('end', () => {
+      fs.unlink(outputFile, () => {});
+    });
+
+    stream.on('error', (err) => {
+      console.error('[download stream error]', err);
+      fs.unlink(outputFile, () => {});
+      if (!res.headersSent) {
+        res.status(500).json({ 
+          success: false, 
+          error: 'Streaming failed' 
+        });
+      }
+    });
+
+  } catch (error) {
+    // Clean up temp file on error
+    if (fs.existsSync(outputFile)) {
+      fs.unlinkSync(outputFile);
+    }
+
+    console.error('[download error]', error.message);
+    
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        success: false, 
+        error: error.message || 'Download failed' 
+      });
+    }
+  }
+});
+
+// ─── GET /api/download/merge - Stream merged video (for video-only formats) ───
+router.get('/merge', async (req, res) => {
+  const { video_id, audio_id, url } = req.query;
+
+  if (!url || !video_id) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'URL and video_id are required' 
+    });
+  }
+
+  const depsOk = await checkDependencies();
+  if (!depsOk) {
+    return res.status(500).json({ 
+      success: false, 
+      error: 'yt-dlp or ffmpeg not installed' 
+    });
+  }
+
+  const outputFile = path.join(TEMP_DIR, `merge_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.mp4`);
+
+  try {
+    console.log(`[merge] Merging video ${video_id} + audio for: ${url}`);
+
+    let command;
+    if (audio_id) {
+      // Specific video + audio format
+      command = `yt-dlp -f "${video_id}+${audio_id}" --merge-output-format mp4 -o "${outputFile}" "${url}"`;
+    } else {
+      // Video + best audio
+      command = `yt-dlp -f "${video_id}+bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio" --merge-output-format mp4 -o "${outputFile}" "${url}"`;
+    }
+
+    await execPromise(command, { 
+      maxBuffer: 500 * 1024 * 1024, 
+      timeout: 600000 
+    });
+
+    if (!fs.existsSync(outputFile)) {
+      throw new Error('Merge failed - no output file');
+    }
+
+    const stat = fs.statSync(outputFile);
+
+    // Headers for streaming (supports seeking)
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="video.mp4"`);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Accept-Ranges');
+
+    // Handle range requests for video seeking
+    const range = req.headers.range;
+    if (range) {
+      const parts = range.replace(/bytes=/, '').split('-');
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+      const chunksize = (end - start) + 1;
+
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
+      res.setHeader('Content-Length', chunksize);
+      res.status(206);
+
+      const stream = fs.createReadStream(outputFile, { start, end });
+      stream.pipe(res);
+
+      stream.on('end', () => {
+        fs.unlink(outputFile, () => {});
+      });
+    } else {
+      const stream = fs.createReadStream(outputFile);
+      stream.pipe(res);
+
+      stream.on('end', () => {
+        fs.unlink(outputFile, () => {});
       });
     }
 
-    return res.json({ success: true, history_id: historyId, info: result.info });
+  } catch (error) {
+    if (fs.existsSync(outputFile)) {
+      fs.unlinkSync(outputFile);
+    }
 
-  } catch (err) {
-    console.error('Download error:', err.message);
-    db.prepare(`UPDATE download_history SET status = 'failed', error = ? WHERE id = ?`)
-      .run(err.message, historyId);
-
-    return res.status(500).json({
-      error: 'Download failed',
-      message: err.message,
-      history_id: historyId,
-    });
+    console.error('[merge error]', error.message);
+    
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        success: false, 
+        error: error.message || 'Merge failed' 
+      });
+    }
   }
 });
 
-/**
- * GET /api/download/file/:historyId/:filename
- * Streams or serves a downloaded file
- */
-router.get('/file/:historyId/:filename', (req, res) => {
-  const { historyId, filename } = req.params;
+// ─── GET /audio - Direct MP3 download (PROBLEM 3 FIXED) ───────────────────────
+router.get('/audio', async (req, res) => {
+  const { url, quality = '192' } = req.query;
 
-  // Security: prevent path traversal
-  if (filename.includes('..') || filename.includes('/')) {
-    return res.status(400).json({ error: 'Invalid filename' });
-  }
-
-  const filePath = path.join(DOWNLOAD_DIR, filename);
-
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: 'File not found' });
-  }
-
-  const ext = path.extname(filename).toLowerCase().slice(1);
-  const mimeTypes = {
-    mp4: 'video/mp4', mkv: 'video/x-matroska', webm: 'video/webm',
-    mp3: 'audio/mpeg', m4a: 'audio/mp4', opus: 'audio/ogg',
-    wav: 'audio/wav',  flac: 'audio/flac',
-    srt: 'text/plain', vtt: 'text/vtt',
-  };
-
-  const mime = mimeTypes[ext] || 'application/octet-stream';
-  const stat = fs.statSync(filePath);
-
-  // Support range requests (for video preview/streaming)
-  const range = req.headers.range;
-  if (range && mime.startsWith('video/')) {
-    const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0], 10);
-    const end   = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
-    const chunkSize = (end - start) + 1;
-
-    res.writeHead(206, {
-      'Content-Range':  `bytes ${start}-${end}/${stat.size}`,
-      'Accept-Ranges':  'bytes',
-      'Content-Length': chunkSize,
-      'Content-Type':   mime,
+  if (!url) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'URL is required' 
     });
-    fs.createReadStream(filePath, { start, end }).pipe(res);
-  } else {
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Content-Type', mime);
+  }
+
+  const depsOk = await checkDependencies();
+  if (!depsOk) {
+    return res.status(500).json({ 
+      success: false, 
+      error: 'yt-dlp not installed' 
+    });
+  }
+
+  const outputFile = path.join(TEMP_DIR, `audio_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.mp3`);
+
+  try {
+    console.log(`[audio] Extracting audio from: ${url}`);
+
+    await execPromise(
+      `yt-dlp -x --audio-format mp3 --audio-quality ${quality}k -o "${outputFile}" "${url}"`,
+      { maxBuffer: 200 * 1024 * 1024, timeout: 300000 }
+    );
+
+    if (!fs.existsSync(outputFile)) {
+      throw new Error('Audio extraction failed');
+    }
+
+    const stat = fs.statSync(outputFile);
+
+    // Headers for direct download
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', 'attachment; filename="audio.mp3"');
     res.setHeader('Content-Length', stat.size);
     res.setHeader('Accept-Ranges', 'bytes');
-    fs.createReadStream(filePath).pipe(res);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length');
+
+    const stream = fs.createReadStream(outputFile);
+    stream.pipe(res);
+
+    stream.on('end', () => {
+      fs.unlink(outputFile, () => {});
+    });
+
+  } catch (error) {
+    if (fs.existsSync(outputFile)) {
+      fs.unlinkSync(outputFile);
+    }
+
+    console.error('[audio error]', error.message);
+    
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        success: false, 
+        error: error.message || 'Audio extraction failed' 
+      });
+    }
   }
 });
 
-/**
- * DELETE /api/download/file/:filename
- * Delete a downloaded file
- */
-router.delete('/file/:filename', (req, res) => {
-  const { filename } = req.params;
-  if (filename.includes('..') || filename.includes('/')) {
-    return res.status(400).json({ error: 'Invalid filename' });
-  }
-  const filePath = path.join(DOWNLOAD_DIR, filename);
-  if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  res.json({ success: true, message: 'File deleted' });
+// ─── OPTIONS for CORS ─────────────────────────────────────────────────────────
+router.options('*', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-API-Key');
+  res.sendStatus(200);
 });
-
-function isValidUrl(str) {
-  try { new URL(str); return true; } catch { return false; }
-}
-
-function getFileSize(filePath) {
-  if (!filePath || !fs.existsSync(filePath)) return null;
-  return fs.statSync(filePath).size;
-}
 
 module.exports = router;
